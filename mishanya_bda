@@ -1,0 +1,186 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+# nae8Eegathae2Eel
+
+# Импорт стандартных модулей
+import readline
+import pickle
+from base64 import b64encode
+from getpass import getpass
+
+# Импорт сторонних модулей
+import requests
+from bs4 import BeautifulSoup
+
+# Создание основных переменных
+url = 'http://bda.s.sprinthost.ru'
+useragent = 'bda-app/0.0.4'
+sessionFile = 'session.tmp'
+
+
+def openSession(filename):
+    '''Функция открывает файл сессии.
+    Принимает название файла, возращает объект сессии.'''
+
+    try:
+        with open(filename, 'rb') as file:
+            return pickle.load(file)
+    except FileNotFoundError:
+        print('Файл сессии не найден')
+        exit()
+
+
+def saveSession(filename, session):
+    '''Принимает имя файла и сессию, записавает ее этот файл.'''
+
+    with open(filename, 'wb') as file:
+        pickle.dump(session, file)
+
+
+def askAuth():
+    '''Спашивает у пользователя логин и пароль от BDA.
+    Возвращает список [логин, пароль].'''
+
+    return [input('Логин : '), getpass('Пароль: ')]
+
+
+def makeAuthHeader(authData):
+    '''Функция принимает пару [логин, пароль] и возращает
+    значени�� заголовка Authorization для HTTP-запроса.'''
+
+    authPair = authData[0] + ':' + authData[1]
+    byteData = b64encode(authPair.encode('utf-8'))
+    return 'Basic ' + byteData.decode('utf-8')
+
+
+# Открываем файл сессии
+session = openSession(sessionFile)
+
+# Проверяем сессию.
+if session.get(url).status_code != 200:
+
+    # Если устарела - Формируем заголовок Authorization из
+    # запрашиваемых функцией логина и пароля
+    # , создаем новую сессию
+    authHeader = makeAuthHeader(askAuth())
+
+    session = requests.Session()
+    session.headers.update({'user-agent': useragent,
+                            'Authorization': authHeader})
+
+    # Проверяем, если успешная авторизация - пишем сессию в файл
+    if session.get(url).status_code == 200:
+        print('Успешное подключение.')
+        saveSession(sessionFile, session)
+    else:
+        print('Ошибка!')
+        exit()
+
+for i in range(300):
+
+    # Осуществляем поиск по биллингу
+    search = input('Поиск: ')
+    if search == 'q':
+        break
+    elif search == '':
+        search = 'mfedoseev'
+
+    response = session.get(url, params={'t': 'login', 'q': search})
+
+    print(response.url)
+
+    # Если сразу попали на accounts.php: делаем XHR-запросы
+    if 'accounts.php' in response.url:
+
+        # Обновляем заголовки запроса для получения JSON
+        session.headers.update({
+            'X-Requested-With': 'XMLHttpRequest',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'Accept': 'application/json, text/javascript, */*; q=0.01'})
+
+        # Получаем из URL корректный логин аккаунта
+        login = response.url.partition('login=')[2]
+
+        # Наборы данных для совершения запросов
+        formDataMenu = {'action': 'update_menu', 'login': login}
+        formDataOverview = {'action': 'update_overview', 'login': login}
+        formDataIPs = {'action': 'get_customer_ips', 'login': login}
+
+        # Получаем JSON-объекты
+        responseMenu = session.post(response.url, data=formDataMenu)
+        responseOverview = session.post(response.url, data=formDataOverview)
+        responseIPs = session.post(response.url, data=formDataIPs)
+
+        htmlMenu = responseMenu.json()['menu']
+        htmlOverview = responseOverview.json()['content']
+        IPs = responseIPs.json()['content']
+
+        # Создаем soup-объекты, парсим разметку
+        soupMenu = BeautifulSoup(htmlMenu, 'html.parser')
+        soupOverview = BeautifulSoup(htmlOverview, 'html.parser')
+        soupIPs = BeautifulSoup(IPs, 'html.parser')
+
+        # Список данных для вывода
+        parsedMenu: list = []
+
+        # Добавляем первые два "нестандартных" поля
+        parsedMenu.append(['Логин', login])
+        parsedMenu.append(['PIN', soupMenu.a.get_text()])
+
+        # Находим все теги
+        for trTags in soupMenu('tr'):
+            tdTags = trTags.find_all('td')
+
+            # Отсеиваем пустые и ненужные теги
+            if None in tdTags:
+                continue
+
+            if len(tdTags) < 2:
+                continue
+
+            if len(tdTags) > 2 and not tdTags[0].get_text().startswith('Доп'):
+                continue
+
+            # Добавляем оставшиеся поля в список данных
+            parsedMenu.append([tdTags[0].get_text(), tdTags[1].get_text()])
+
+        # Имправляем некоторые значения
+        for field in parsedMenu:
+            if field[0].startswith('Сервер'):
+                field += field.pop().split()
+
+            if field[0].startswith('Тарифный план'):
+                field += field.pop().split()
+
+            if field[0].startswith('Дополнительно'):
+                field.append(field.pop().split()[-1])
+
+            if field[0].startswith('Бесплатный'):
+                field.append(field.pop().split()[0])
+
+            # Находим IP-адреса, полученные отдельным запросом
+            if field[0].startswith('IP-адреса'):
+                if 'span' not in IPs:
+                    field[1] = [IPs.strip(), 'общий']
+                    continue
+                field.pop()
+                ipList = soupIPs.get_text().split()[3:]
+                for i, el in enumerate(ipList):
+                    try:
+                        if ipList[i+1].startswith('п'):
+                            field.append([el, 'персональный'])
+                        elif el.startswith('п'):
+                            continue
+                        else:
+                            field.append([el, 'общий'])
+                    except IndexError:
+                        pass
+        # Вывод данных
+        print("####PARSED DATA####")
+        for field in parsedMenu:
+            print(field)
+
+    # Если не попали на accounts.php
+    else:
+        print('Аккаунт не найден, удален, либо их несколько')
